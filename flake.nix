@@ -14,6 +14,8 @@
       buildInputs = [
         pkgs.zig
         pkgs.zls
+        pkgs.tcpdump
+        pkgs.dig
       ];
     };
   };

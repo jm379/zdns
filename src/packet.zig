@@ -180,10 +180,10 @@ const ResourceRecord = struct {
         pos.* += 2;
 
         if (!question) {
-            std.debug.print("data: {x}\n", .{data[pos.*..]});
-            // TODO: this is wrong
-            ttl = bytesToInt(data[pos.*], data[pos.* + 1]) +
-                bytesToInt(data[pos.* + 2], data[pos.* + 3]);
+            ttl = (@as(u32, data[pos.*]) << 24) |
+                (@as(u32, data[pos.* + 1]) << 16) |
+                (@as(u32, data[pos.* + 2]) << 8) |
+                @as(u32, data[pos.* + 3]);
             pos.* += 4;
 
             rd_length = bytesToInt(data[pos.*], data[pos.* + 1]);
@@ -267,7 +267,7 @@ test "Should deserialize Answer ResourceRecord" {
         0xc0, 0x0c, // Pointer to 0x0c - "www.example.com"
         0x00, 0x05, // Type = CNAME
         0x00, 0x01, // Class = IN
-        0x00, 0x00, 0x00, 0x5b, // TTL = 91 seconds
+        0x01, 0x02, 0x03, 0x04, // TTL = 16909060 seconds
         0x00, 0x22, // RDLENGTH = 34
         0x03, 0x77, 0x77, 0x77, // www
         0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, // example
@@ -283,7 +283,7 @@ test "Should deserialize Answer ResourceRecord" {
     try std.testing.expectEqualSlices(u8, "www.example.com", answer.name);
     try std.testing.expectEqual(QueryType.CNAME, answer.type);
     try std.testing.expectEqual(QueryClass.IN, answer.class);
-    try std.testing.expectEqual(91, answer.ttl);
+    try std.testing.expectEqual(16909060, answer.ttl);
     try std.testing.expectEqual(34, answer.rd_length);
 
     var r_data = [_]u8{

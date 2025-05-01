@@ -142,9 +142,6 @@ const ResourceRecord = struct {
     class: QueryClass,
     ttl: u32 = undefined,
     rd_length: u16 = undefined,
-    // TODO:
-    // Maybe make r_data an enum with all TYPES,
-    // that can be deserialized
     r_data: ?[]u8 = null,
     fn init(config: QuestionConfig) !ResourceRecord {
         if (config.query_name.len > 253) return DNSError.DomainTooLong;
@@ -174,34 +171,51 @@ const ResourceRecord = struct {
         var ttl: u32 = 0;
         var r_data: ?[]u8 = null;
 
-        const query_type = bytesToInt(data[pos.*], data[pos.* + 1]);
+        const query_type = parseQueryType(data[pos.* .. pos.* + 2]);
         pos.* += 2;
-        const query_class = bytesToInt(data[pos.*], data[pos.* + 1]);
+        const query_class = parseQueryClass(data[pos.* .. pos.* + 2]);
         pos.* += 2;
 
         if (!question) {
-            ttl = (@as(u32, data[pos.*]) << 24) |
-                (@as(u32, data[pos.* + 1]) << 16) |
-                (@as(u32, data[pos.* + 2]) << 8) |
-                @as(u32, data[pos.* + 3]);
+            ttl = parseTTL(data[pos.* .. pos.* + 5]);
             pos.* += 4;
 
-            rd_length = bytesToInt(data[pos.*], data[pos.* + 1]);
+            rd_length = parseRDLength(data[pos.* .. pos.* + 2]);
             pos.* += 2;
 
-            r_data = data[pos.* .. pos.* + rd_length];
+            r_data = parseRData(data[pos.* .. pos.* + rd_length], query_type);
             pos.* += rd_length;
         }
 
         return .{
             .allocator = allocator,
             .name = name,
-            .type = valueToEnum(QueryType, query_type, 0x00_FF),
-            .class = valueToEnum(QueryClass, query_class, 0xFF_FF),
+            .type = query_type,
+            .class = query_class,
             .ttl = ttl,
             .rd_length = rd_length,
             .r_data = r_data,
         };
+    }
+    fn parseQueryType(buff: []u8) QueryType {
+        return valueToEnum(QueryType, bytesToInt(buff[0], buff[1]), 0x00_FF);
+    }
+    fn parseQueryClass(buff: []u8) QueryClass {
+        return valueToEnum(QueryClass, bytesToInt(buff[0], buff[1]), 0xFF_FF);
+    }
+    fn parseTTL(buff: []u8) u32 {
+        return (@as(u32, buff[0]) << 24) |
+            (@as(u32, buff[1]) << 16) |
+            (@as(u32, buff[2]) << 8) |
+            @as(u32, buff[3]);
+    }
+    fn parseRDLength(buff: []u8) u16 {
+        return bytesToInt(buff[0], buff[1]);
+    }
+    fn parseRData(buff: []u8, queryType: QueryType) []u8 {
+        // TODO: parse rdata depending on the QueryType
+        _ = queryType;
+        return buff;
     }
 };
 

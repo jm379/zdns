@@ -9,7 +9,11 @@ const DNSError = error{
     InvalidCompression,
     InvalidPointer,
     EmptyPacket,
+    PacketTooSmall,
+    PacketTooLong,
 };
+
+var compressed: bool = false;
 
 const QueryResponse = enum(u16) { query = 0, response = 0x80_00 };
 const OperationCode = enum(u16) { standard = 0, inverse = 0x08_00, status = 0x10_00, notify = 0x18_00, update = 0x20_00 };
@@ -87,7 +91,7 @@ const Header = struct {
         return 12;
     }
     fn deserialize(data: []u8) DNSError!Header {
-        if (data.len != 12) return DNSError.WrongSize;
+        if (data.len < 12) return DNSError.WrongSize;
 
         return .{
             .id = bytesToInt(data[0], data[1]),
@@ -165,26 +169,19 @@ const ResourceRecord = struct {
 
         return len + 4;
     }
-    fn deserialize(allocator: std.mem.Allocator, data: []u8, pos: *usize, question: bool) !ResourceRecord {
-        const name = try labelsToDomain(allocator, data, pos);
+    fn deserialize(allocator: std.mem.Allocator, packet: []u8, pos: *usize, question: bool) !ResourceRecord {
+        const name = try labelsToDomain(allocator, packet, pos);
         var rd_length: u16 = 0;
         var ttl: u32 = 0;
         var r_data: ?[]u8 = null;
 
-        const query_type = parseQueryType(data[pos.* .. pos.* + 2]);
-        pos.* += 2;
-        const query_class = parseQueryClass(data[pos.* .. pos.* + 2]);
-        pos.* += 2;
+        const query_type = parseQueryType(packet, pos);
+        const query_class = parseQueryClass(packet, pos);
 
         if (!question) {
-            ttl = parseTTL(data[pos.* .. pos.* + 5]);
-            pos.* += 4;
-
-            rd_length = parseRDLength(data[pos.* .. pos.* + 2]);
-            pos.* += 2;
-
-            r_data = parseRData(data[pos.* .. pos.* + rd_length], query_type);
-            pos.* += rd_length;
+            ttl = parseTTL(packet, pos);
+            rd_length = parseRDLength(packet, pos);
+            r_data = parseRData(packet, query_type, rd_length, pos);
         }
 
         return .{
@@ -197,25 +194,46 @@ const ResourceRecord = struct {
             .r_data = r_data,
         };
     }
-    fn parseQueryType(buff: []u8) QueryType {
-        return valueToEnum(QueryType, bytesToInt(buff[0], buff[1]), 0x00_FF);
+    fn parseQueryType(packet: []u8, pos: *usize) QueryType {
+        const h: u8 = packet[pos.*];
+        const l: u8 = packet[pos.* + 1];
+        pos.* += 2;
+
+        return valueToEnum(QueryType, bytesToInt(h, l), 0x00_FF);
     }
-    fn parseQueryClass(buff: []u8) QueryClass {
-        return valueToEnum(QueryClass, bytesToInt(buff[0], buff[1]), 0xFF_FF);
+    fn parseQueryClass(packet: []u8, pos: *usize) QueryClass {
+        const h: u8 = packet[pos.*];
+        const l: u8 = packet[pos.* + 1];
+        pos.* += 2;
+
+        return valueToEnum(QueryClass, bytesToInt(h, l), 0xFF_FF);
     }
-    fn parseTTL(buff: []u8) u32 {
-        return (@as(u32, buff[0]) << 24) |
-            (@as(u32, buff[1]) << 16) |
-            (@as(u32, buff[2]) << 8) |
-            @as(u32, buff[3]);
+    fn parseTTL(packet: []u8, pos: *usize) u32 {
+        const b1: u8 = packet[pos.*];
+        const b2: u8 = packet[pos.* + 1];
+        const b3: u8 = packet[pos.* + 2];
+        const b4: u8 = packet[pos.* + 3];
+        pos.* += 4;
+
+        return (@as(u32, b1) << 24) |
+            (@as(u32, b2) << 16) |
+            (@as(u32, b3) << 8) |
+            @as(u32, b4);
     }
-    fn parseRDLength(buff: []u8) u16 {
-        return bytesToInt(buff[0], buff[1]);
+    fn parseRDLength(packet: []u8, pos: *usize) u16 {
+        const h: u8 = packet[pos.*];
+        const l: u8 = packet[pos.* + 1];
+        pos.* += 2;
+
+        return bytesToInt(h, l);
     }
-    fn parseRData(buff: []u8, queryType: QueryType) []u8 {
+    fn parseRData(packet: []u8, queryType: QueryType, rd_length: u16, pos: *usize) []u8 {
         // TODO: parse rdata depending on the QueryType
         _ = queryType;
-        return buff;
+        const r_data = packet[pos.* .. pos.* + rd_length];
+        pos.* += rd_length;
+
+        return r_data;
     }
 };
 
@@ -233,7 +251,7 @@ test "Should serialize Question ResourceRecord" {
 
 test "Should deserialize Question ResourceRecord" {
     const allocator = std.testing.allocator;
-    var message = [_]u8{
+    var packet = [_]u8{
         // Headers
         0x12, 0x34, // ID
         0x81, 0x80, // Flags
@@ -246,11 +264,11 @@ test "Should deserialize Question ResourceRecord" {
         0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
         0x03, 0x63, 0x6F, 0x6D, // com
         0x00, // null
-        0x00, 0x01, // QType
-        0x00, 0x01, // Class
+        0x00, 0x01, // Type = A
+        0x00, 0x01, // Class = IN
     };
     var offset: usize = 12;
-    var question = try ResourceRecord.deserialize(allocator, &message, &offset, true);
+    var question = try ResourceRecord.deserialize(allocator, &packet, &offset, true);
     defer question.deinit();
 
     try std.testing.expectEqualSlices(u8, "www.example.com", question.name);
@@ -343,7 +361,7 @@ test "Should deserialize OPT Aditional Record ResourceRecord" {
 
     try std.testing.expectEqualSlices(u8, "", answer.name);
     try std.testing.expectEqual(QueryType.OPT, answer.type);
-    try std.testing.expectEqual(0x04_d0, @intFromEnum(answer.class));
+    try std.testing.expectEqual(0x04_D0, @intFromEnum(answer.class));
     try std.testing.expectEqual(0, answer.ttl);
     try std.testing.expectEqual(0, answer.rd_length);
 
@@ -354,12 +372,12 @@ test "Should deserialize OPT Aditional Record ResourceRecord" {
 
 const PacketConfig = struct { id: u16, query_type: QueryType = .A, query_name: []u8 };
 pub const Packet = struct {
-    data: []u8 = undefined,
+    allocator: std.mem.Allocator = undefined,
     header: Header,
     question: ResourceRecord,
-    answer: []ResourceRecord = undefined,
-    authority: []ResourceRecord = undefined,
-    additional: []ResourceRecord = undefined,
+    answer: ?[]ResourceRecord = null,
+    authority: ?[]ResourceRecord = null,
+    additional: ?[]ResourceRecord = null,
     pub fn init(config: PacketConfig) !Packet {
         return .{ .header = Header{
             .id = config.id,
@@ -371,7 +389,18 @@ pub const Packet = struct {
         }) };
     }
     pub fn deinit(self: *Packet) void {
-        self.allocator.free(self.data);
+        self.question.deinit();
+        freeResourceRecords(self.allocator, self.answer);
+        freeResourceRecords(self.allocator, self.authority);
+        freeResourceRecords(self.allocator, self.additional);
+    }
+    fn freeResourceRecords(allocator: std.mem.Allocator, rrecords: ?[]ResourceRecord) void {
+        if (rrecords) |records| {
+            for (records) |*record| {
+                record.deinit();
+            }
+            allocator.free(records);
+        }
     }
     pub fn serialize(self: *Packet, buff: []u8) !usize {
         var tlen: usize = 0;
@@ -383,7 +412,36 @@ pub const Packet = struct {
 
         return tlen;
     }
-    pub fn deserialize() !Packet {}
+    pub fn deserialize(allocator: std.mem.Allocator, data: []u8) !Packet {
+        switch (data.len) {
+            0 => return error.EmptyPacket,
+            1...17 => return error.PacketTooSmall,
+            18...512 => {},
+            else => return error.PacketTooLong,
+        }
+
+        var pos: usize = 12;
+        var packet = Packet{
+            .allocator = allocator,
+            .header = try Header.deserialize(data),
+            .question = try ResourceRecord.deserialize(allocator, data, &pos, true),
+        };
+
+        if (packet.header.answer_count > 0) {
+            packet.answer = try allocator.alloc(ResourceRecord, packet.header.answer_count);
+            for (0..packet.header.answer_count) |i| {
+                packet.answer.?[i] = try ResourceRecord.deserialize(allocator, data, &pos, false);
+            }
+        }
+        if (packet.header.authoritive_count > 0) {
+            packet.authority = try allocator.alloc(ResourceRecord, packet.header.authoritive_count);
+        }
+        if (packet.header.additional_count > 0) {
+            packet.additional = try allocator.alloc(ResourceRecord, packet.header.additional_count);
+        }
+
+        return packet;
+    }
 };
 
 test "Should serialize Packet" {
@@ -399,8 +457,8 @@ test "Should serialize Packet" {
 }
 
 test "Should deserialize Packet" {
-    const buffer: [512]u8 = undefined;
-    const message = [_]u8{
+    const allocator = std.testing.allocator;
+    var packet = [_]u8{
         // Headers
         0x12, 0x34, // ID
         0x81, 0x80, // Flags
@@ -452,8 +510,66 @@ test "Should deserialize Packet" {
         0x00, 0x04, // RDLENGTH = 4
         0x02, 0x13, 0x0a, 0x33, // 2.19.10.51
     };
-    _ = buffer;
-    _ = message;
+    var answer = try Packet.deserialize(allocator, &packet);
+    defer answer.deinit();
+
+    // Headers
+    try std.testing.expectEqual(0x12_34, answer.header.id);
+    try std.testing.expectEqual(QueryResponse.response, answer.header.flags.query_response);
+    try std.testing.expectEqual(OperationCode.standard, answer.header.flags.operation_code);
+    try std.testing.expectEqual(AuthoritativeAnswer.no, answer.header.flags.authorative_answer);
+    try std.testing.expectEqual(Truncated.no, answer.header.flags.truncated);
+    try std.testing.expectEqual(RecursionDesired.yes, answer.header.flags.recursion_desired);
+    try std.testing.expectEqual(RecursionAvailable.yes, answer.header.flags.recursion_available);
+    try std.testing.expectEqual(ResponseCode.no_error, answer.header.flags.response_code);
+    try std.testing.expectEqual(0x00_01, answer.header.question_count);
+    try std.testing.expectEqual(0x00_04, answer.header.answer_count);
+    try std.testing.expectEqual(0x00_00, answer.header.authoritive_count);
+    try std.testing.expectEqual(0x00_00, answer.header.additional_count);
+
+    // Question
+    try std.testing.expectEqualSlices(u8, "www.example.com", answer.question.name);
+    try std.testing.expectEqual(QueryType.A, answer.question.type);
+    try std.testing.expectEqual(QueryClass.IN, answer.question.class);
+    try std.testing.expectEqual(null, answer.question.r_data);
+
+    // Answer 1
+    try std.testing.expectEqualSlices(u8, "www.example.com", answer.answer.?[0].name);
+    try std.testing.expectEqual(QueryType.CNAME, answer.answer.?[0].type);
+    try std.testing.expectEqual(QueryClass.IN, answer.answer.?[0].class);
+    try std.testing.expectEqual(91, answer.answer.?[0].ttl);
+    try std.testing.expectEqual(34, answer.answer.?[0].rd_length);
+
+    // Answer 2
+    try std.testing.expectEqualSlices(u8, "www.example.com-v4.edgesuite.net", answer.answer.?[1].name);
+    try std.testing.expectEqual(QueryType.CNAME, answer.answer.?[1].type);
+    try std.testing.expectEqual(QueryClass.IN, answer.answer.?[1].class);
+    try std.testing.expectEqual(21391, answer.answer.?[1].ttl);
+    try std.testing.expectEqual(20, answer.answer.?[1].rd_length);
+
+    // Answer 3
+    var r_data = [_]u8{ 0x02, 0x13, 0x0a, 0x4b };
+    try std.testing.expectEqualSlices(u8, "a1422.dscr.akamai.net", answer.answer.?[2].name);
+    try std.testing.expectEqual(QueryType.A, answer.answer.?[2].type);
+    try std.testing.expectEqual(QueryClass.IN, answer.answer.?[2].class);
+    try std.testing.expectEqual(20, answer.answer.?[2].ttl);
+    try std.testing.expectEqual(4, answer.answer.?[2].rd_length);
+    try std.testing.expectEqualSlices(u8, &r_data, answer.answer.?[2].r_data.?);
+
+    // Answer 4
+    r_data = [_]u8{ 0x02, 0x13, 0x0a, 0x33 };
+    try std.testing.expectEqualSlices(u8, "a1422.dscr.akamai.net", answer.answer.?[3].name);
+    try std.testing.expectEqual(QueryType.A, answer.answer.?[3].type);
+    try std.testing.expectEqual(QueryClass.IN, answer.answer.?[3].class);
+    try std.testing.expectEqual(20, answer.answer.?[3].ttl);
+    try std.testing.expectEqual(4, answer.answer.?[3].rd_length);
+    try std.testing.expectEqualSlices(u8, &r_data, answer.answer.?[3].r_data.?);
+
+    // Authorative Answers
+    try std.testing.expectEqual(null, answer.authority);
+
+    // Aditional
+    try std.testing.expectEqual(null, answer.additional);
 }
 
 pub fn genRandomID(seed: u64) !u16 {
@@ -547,148 +663,88 @@ test "Should return BufferTooSmall error when the buffer cant contain the result
 }
 
 fn isCompressionByte(byte: u8) bool {
-    return byte & 0xC0 == 0xC0;
+    return byte == 0xC0;
 }
 
-fn sequentialLabelsToDomain(buff: []u8, labels: []u8, pos: usize) DNSError!usize {
-    if (labels.len > 255) return DNSError.LabelTooLong;
-    if (buff.len < labels.len + 2) return DNSError.BufferTooSmall;
+fn sequentialLabelsToDomain(domain: []u8, packet: []u8, pos: *usize, mlen: usize) DNSError!usize {
+    const len: u8 = packet[pos.*];
+    if (len == 0) return mlen; // null byte
+    if (isCompressionByte(len)) return mlen + try compressedLabelsToDomain(domain, packet, pos);
 
-    const len: u8 = labels[0];
-    if (isCompressionByte(len)) return pos;
-    if (len == 0 and pos == 0) return pos;
-    if (len == 0) return pos - 1;
+    @memcpy(domain[0..len], packet[pos.* + 1 .. pos.* + len + 1]);
+    domain[len] = '.';
 
-    @memcpy(buff[pos .. pos + len], labels[1 .. len + 1]);
-    if (labels[len + 1] != 0) buff[pos + len] = '.';
-
-    return try sequentialLabelsToDomain(buff, labels[len + 1 ..], pos + len + 1);
+    pos.* += len + 1;
+    return try sequentialLabelsToDomain(domain[len + 1 ..], packet, pos, mlen + len + 1);
 }
 
 test "Should parse labels to a domain" {
-    var buffer: [32]u8 = undefined;
-    var labels = [_]u8{
+    compressed = false;
+    var domain: [32]u8 = undefined;
+    var packet = [_]u8{
         0x03, 0x77, 0x77, 0x77, // www
         0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
         0x03, 0x63, 0x6F, 0x6D, // com
         0x00, // null
     };
-    const len = try sequentialLabelsToDomain(&buffer, &labels, 0);
-    try std.testing.expectEqualSlices(u8, "www.example.com", buffer[0..len]);
-    try std.testing.expectEqual(15, len);
+    var pos: usize = 0;
+    const len = try sequentialLabelsToDomain(&domain, &packet, &pos, 0);
+
+    try std.testing.expectEqualSlices(u8, "www.example.com.", domain[0..len]);
+    try std.testing.expectEqual(16, len);
+    try std.testing.expectEqual(16, pos);
 }
 
 test "Should not parse when it doesnt have labels" {
-    var buffer: [32]u8 = undefined;
-    var labels = [_]u8{
+    compressed = false;
+    var domain: [32]u8 = undefined;
+    var packet = [_]u8{
         0x00, // null name
     };
-    const len = try sequentialLabelsToDomain(&buffer, &labels, 0);
-    try std.testing.expectEqualSlices(u8, "", buffer[0..len]);
+    var pos: usize = 0;
+    const len = try sequentialLabelsToDomain(&domain, &packet, &pos, 0);
+
+    try std.testing.expectEqualSlices(u8, "", domain[0..len]);
     try std.testing.expectEqual(0, len);
+    try std.testing.expectEqual(0, pos);
 }
 
 test "Should parse labels with compression to a domain" {
-    var buffer: [32]u8 = undefined;
-    var labels = [_]u8{
+    compressed = false;
+    var domain: [32]u8 = undefined;
+    var packet = [_]u8{
+        0x03, 0x6e, 0x65, 0x74, // net
+        0x00, // null
         0x03, 0x77, 0x77, 0x77, // www
         0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
-        0x03, 0x63, 0x6F, 0x6D, // com
-        0xC0, 0x04, // Pointer to example.com
+        0xC0, 0x00, // Pointer to .net
     };
-    const len = try sequentialLabelsToDomain(&buffer, &labels, 0);
-    try std.testing.expectEqualSlices(u8, "www.example.com.", buffer[0..len]);
+    var pos: usize = 5;
+    const len = try sequentialLabelsToDomain(&domain, &packet, &pos, 0);
+
+    try std.testing.expectEqualSlices(u8, "www.example.net.", domain[0..len]);
     try std.testing.expectEqual(16, len);
+    try std.testing.expectEqual(18, pos);
 }
 
-test "Should return BufferTooSmall when buffer is too small to fit the domain" {
-    var buffer: [2]u8 = undefined;
-    var labels = [_]u8{
-        0x03, 0x77, 0x77, 0x77, // www
-        0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
-        0x03, 0x63, 0x6F, 0x6D, // com
-        0x00, // null
-    };
-    try std.testing.expectError(DNSError.BufferTooSmall, sequentialLabelsToDomain(&buffer, &labels, 0));
-}
+fn compressedLabelsToDomain(domain: []u8, packet: []u8, pos: *usize) !usize {
+    if (!isCompressionByte(packet[pos.*])) return 0;
 
-test "Should return LabelTooLong when the labels is too long for a valid domain" {
-    var buffer: [512]u8 = undefined;
-    var labels_253 = [_]u8{
-        0x3f, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, // aaa...
-        0x3f, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, // bbb...
-        0x3f, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, // ccc...
-        0x39, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, // ddd...
-        0x03, 0x63, 0x6f, 0x6d, // com
-        0x00, // null
-    };
-    var labels_254 = [_]u8{
-        0x3f, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, // aaa...
-        0x3f, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, // bbb...
-        0x3f, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, // ccc...
-        0x39, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, // ddd...
-        0x04, 0x63, 0x6f, 0x6d, 0x69, // comi
-        0x00, // null
-    };
-
-    _ = try sequentialLabelsToDomain(&buffer, &labels_253, 0);
-    try std.testing.expectError(DNSError.LabelTooLong, sequentialLabelsToDomain(&buffer, &labels_254, 0));
-}
-
-fn labelsLen(labels: []u8) DNSError!usize {
-    var len: usize = 0;
-    var idx: usize = 0;
-    var jumps: usize = 0;
-    while (true) {
-        const byte = labels[idx];
-        if (byte == 0) break;
-        if (isCompressionByte(byte)) break;
-        if (len > 255) return DNSError.LabelTooLong;
-
-        len += byte;
-        idx += byte + 1;
-        jumps += 1;
-    }
-
-    if (isCompressionByte(labels[len + jumps])) return len + jumps;
-    return len + jumps + 1;
-}
-
-test "Should return the labels length" {
-    var labels = [_]u8{
-        0x03, 0x77, 0x77, 0x77, // www
-        0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
-        0x03, 0x63, 0x6F, 0x6D, // com
-        0x00, // null
-    };
-
-    try std.testing.expectEqual(17, try labelsLen(&labels));
-}
-
-test "Should return the labels with compression length" {
-    var labels = [_]u8{
-        0x03, 0x77, 0x77, 0x77, // www
-        0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
-        0x03, 0x63, 0x6F, 0x6D, // com
-        0xC0, 0x04, // Compression
-    };
-
-    try std.testing.expectEqual(16, try labelsLen(&labels));
-}
-
-fn compressedLabelsToDomain(packet: []u8, buff: []u8, compression: []u8) !usize {
-    const pointer = bytesToInt(compression[0], compression[1]) ^ 0xC0_00;
+    var pointer: usize = packet[pos.* + 1];
     if (pointer > packet.len) return DNSError.InvalidPointer;
     if (isCompressionByte(packet[pointer])) return DNSError.InvalidPointer;
 
-    var len = try labelsLen(packet[pointer..]);
-    len = try sequentialLabelsToDomain(buff, packet[pointer .. pointer + len], 0);
+    if (!compressed) {
+        pos.* += 1;
+        compressed = true;
+    }
 
-    return len;
+    return try sequentialLabelsToDomain(domain, packet, &pointer, 0);
 }
 
 test "Should return compressed labels" {
-    var buffer: [512]u8 = undefined;
+    compressed = false;
+    var domain: [512]u8 = undefined;
     var packet = [_]u8{
         0x03, 0x77, 0x77, 0x77, // www
         0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
@@ -696,27 +752,33 @@ test "Should return compressed labels" {
         0x00, // null
         0xC0, 0x04, // Pointer to example.com
     };
-    var compression = [_]u8{ 0xC0, 0x04 };
-    const len = try compressedLabelsToDomain(&packet, &buffer, &compression);
+    var pos: usize = 17;
+    const len = try compressedLabelsToDomain(&domain, &packet, &pos);
 
-    try std.testing.expectEqualSlices(u8, "example.com", buffer[0..len]);
+    try std.testing.expectEqualSlices(u8, "example.com.", domain[0..len]);
+    try std.testing.expectEqual(12, len);
+    try std.testing.expectEqual(18, pos);
 }
 
 test "Should return InvalidPointer when compression pointer is out of bounds" {
-    var buffer: [512]u8 = undefined;
+    compressed = false;
+    var domain: [512]u8 = undefined;
     var packet = [_]u8{
         0x03, 0x77, 0x77, 0x77, // www
         0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
         0x03, 0x63, 0x6F, 0x6D, // com
         0x00, // null
-        0xC0, 0x20, // Invalid compression pointer (out of bounds)
+        0xC0, 0xFF, // Invalid compression pointer (out of bounds)
     };
-    var compression = [_]u8{ 0xC0, 0x20 };
-    try std.testing.expectError(DNSError.InvalidPointer, compressedLabelsToDomain(&packet, &buffer, &compression));
+    var pos: usize = 17;
+
+    try std.testing.expectError(DNSError.InvalidPointer, compressedLabelsToDomain(&domain, &packet, &pos));
+    try std.testing.expectEqual(17, pos);
 }
 
 test "Should return InvalidPointer when compression pointer points to another pointer" {
-    var buffer: [512]u8 = undefined;
+    compressed = false;
+    var domain: [512]u8 = undefined;
     var packet = [_]u8{
         0x03, 0x77, 0x77, 0x77, // www
         0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, // example
@@ -725,29 +787,23 @@ test "Should return InvalidPointer when compression pointer points to another po
         0xC0, 0x13, // Points to the next pointer
         0xC0, 0x04, // Points to example.com
     };
-    var compression = [_]u8{ 0xC0, 0x13 };
-    try std.testing.expectError(DNSError.InvalidPointer, compressedLabelsToDomain(&packet, &buffer, &compression));
+    var pos: usize = 17;
+
+    try std.testing.expectError(DNSError.InvalidPointer, compressedLabelsToDomain(&domain, &packet, &pos));
+    try std.testing.expectEqual(17, pos);
 }
 
 fn labelsToDomain(allocator: std.mem.Allocator, packet: []u8, pos: *usize) ![]u8 {
-    var temp: [512]u8 = undefined;
+    var domain: [512]u8 = undefined;
     var len: usize = 0;
+    compressed = false;
 
-    if (isCompressionByte(packet[pos.*])) {
-        len = try compressedLabelsToDomain(packet, &temp, packet[pos.* .. pos.* + 2]);
-    } else {
-        len = try sequentialLabelsToDomain(&temp, packet[pos.*..], 0);
-        if (len == 0) {
-            pos.* += 1;
-            return "";
-        }
-        pos.* += len;
-        if (isCompressionByte(packet[pos.*])) {
-            len += try compressedLabelsToDomain(packet, temp[len..], packet[pos.* .. pos.* + 2]);
-        }
-    }
-    pos.* += 2;
-    return try allocator.dupe(u8, temp[0..len]);
+    len += try sequentialLabelsToDomain(&domain, packet, pos, 0);
+    pos.* += 1;
+
+    if (len == 0) return try allocator.dupe(u8, "");
+
+    return try allocator.dupe(u8, domain[0 .. len - 1]);
 }
 
 test "Should handle sequential labels" {

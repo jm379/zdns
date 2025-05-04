@@ -39,8 +39,8 @@ const Flags = struct {
             @intFromEnum(self.recursion_available) |
             @intFromEnum(self.response_code);
     }
-    fn deserialize(high: u8, low: u8) Flags {
-        const value = bytesToInt(high, low);
+    fn deserialize(data: []u8) Flags {
+        const value = bytesToInt(data[0], data[1]);
         return .{
             .query_response = valueToEnum(QueryResponse, value, @intFromEnum(QueryResponse.response)),
             .operation_code = valueToEnum(OperationCode, value, 0x78_00),
@@ -53,14 +53,17 @@ const Flags = struct {
     }
 };
 
+test "Should serialize Flags" {
+    var flags: Flags = Flags{ .operation_code = .inverse };
+    const data: u16 = flags.serialize();
+
+    try std.testing.expectEqual(0b0000_1001_0000_0000, data);
+}
+
 test "Should deserialize Flags" {
-    const allocator = std.testing.allocator;
-    const message = "\x81\x80";
-
-    const data = try allocator.dupe(u8, message);
-    defer allocator.free(data);
-
-    const flags = Flags.deserialize(data[0], data[1]);
+    var data = [2]u8{ 0x81, 0x80 };
+    const flags = Flags.deserialize(&data);
+    _ = &data;
 
     try std.testing.expectEqual(QueryResponse.response, flags.query_response);
     try std.testing.expectEqual(OperationCode.standard, flags.operation_code);
@@ -95,7 +98,7 @@ const Header = struct {
 
         return .{
             .id = bytesToInt(data[0], data[1]),
-            .flags = Flags.deserialize(data[2], data[3]),
+            .flags = Flags.deserialize(data[2..4]),
             .question_count = bytesToInt(data[4], data[5]),
             .answer_count = bytesToInt(data[6], data[7]),
             .authoritive_count = bytesToInt(data[8], data[9]),
@@ -108,18 +111,15 @@ test "Should serialize Header" {
     var buffer: [32]u8 = undefined;
     var header = Header{ .id = 0x12_34, .flags = Flags{}, .question_count = 1 };
 
-    const expected = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00";
+    const expected = [_]u8{ 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     const len = try header.serialize(&buffer);
-    try std.testing.expectEqualSlices(u8, expected, buffer[0..len]);
+    try std.testing.expectEqualSlices(u8, &expected, buffer[0..len]);
 }
 
 test "Should deserialize Header" {
-    const allocator = std.testing.allocator;
-    const message = "\x12\x34\x81\x80\x00\x01\x00\x04\x00\x00\x00\x00";
-
-    const data = try allocator.dupe(u8, message);
-    defer allocator.free(data);
-    const header = try Header.deserialize(data);
+    var data = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 };
+    const header = try Header.deserialize(&data);
+    _ = &data;
 
     try std.testing.expectEqual(0x12_34, header.id);
     try std.testing.expectEqual(QueryResponse.response, header.flags.query_response);
@@ -370,7 +370,7 @@ test "Should deserialize OPT Aditional Record ResourceRecord" {
     try std.testing.expectEqual(43 + 1, offset);
 }
 
-const PacketConfig = struct { id: u16, query_type: QueryType = .A, query_name: []u8 };
+const PacketConfig = struct { allocator: std.mem.Allocator, id: u16, query_type: QueryType = .A, query_name: []u8 };
 pub const Packet = struct {
     allocator: std.mem.Allocator = undefined,
     header: Header,
@@ -379,7 +379,7 @@ pub const Packet = struct {
     authority: ?[]ResourceRecord = null,
     additional: ?[]ResourceRecord = null,
     pub fn init(config: PacketConfig) !Packet {
-        return .{ .header = Header{
+        return .{ .allocator = config.allocator, .header = Header{
             .id = config.id,
             .flags = .{},
             .question_count = 1,
@@ -435,9 +435,15 @@ pub const Packet = struct {
         }
         if (packet.header.authoritive_count > 0) {
             packet.authority = try allocator.alloc(ResourceRecord, packet.header.authoritive_count);
+            for (0..packet.header.authoritive_count) |i| {
+                packet.authority.?[i] = try ResourceRecord.deserialize(allocator, data, &pos, false);
+            }
         }
         if (packet.header.additional_count > 0) {
             packet.additional = try allocator.alloc(ResourceRecord, packet.header.additional_count);
+            for (0..packet.header.additional_count) |i| {
+                packet.additional.?[i] = try ResourceRecord.deserialize(allocator, data, &pos, false);
+            }
         }
 
         return packet;
@@ -447,13 +453,28 @@ pub const Packet = struct {
 test "Should serialize Packet" {
     const allocator = std.testing.allocator;
     var buffer: [512]u8 = undefined;
-    var name = try allocator.dupe(u8, "www.example.com");
-    defer allocator.free(name);
-    var packet = try Packet.init(.{ .query_name = name[0..], .id = 0x1234 });
+    var name = [_]u8{ 'w', 'w', 'w', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm' };
+    var packet = try Packet.init(.{ .allocator = allocator, .query_name = &name, .id = 0x1234 });
 
-    const expected = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03\x77\x77\x77\x07\x65\x78\x61\x6d\x70\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01";
+    const expected = [_]u8{
+        // Headers
+        0x12, 0x34, // ID
+        0x01, 0x00, // Flags
+        0x00, 0x01, // QD Count = 1
+        0x00, 0x00, // AN Count = 0
+        0x00, 0x00, // NS Count = 0
+        0x00, 0x00, // AR Count = 0
+        // Question
+        0x03, 0x77, 0x77, 0x77, // www
+        0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, // example
+        0x03, 0x63, 0x6f, 0x6d, // com
+        0x00, // null
+        0x00, 0x01, // Type = A
+        0x00, 0x01, // Class = IN
+    };
     const len = try packet.serialize(&buffer);
-    try std.testing.expectEqualSlices(u8, expected, buffer[0..len]);
+
+    try std.testing.expectEqualSlices(u8, &expected, buffer[0..len]);
 }
 
 test "Should deserialize Packet" {
@@ -567,6 +588,82 @@ test "Should deserialize Packet" {
 
     // Authorative Answers
     try std.testing.expectEqual(null, answer.authority);
+
+    // Aditional
+    try std.testing.expectEqual(null, answer.additional);
+}
+
+test "Should deserialize SOA Packet" {
+    const allocator = std.testing.allocator;
+    var packet = [_]u8{
+        // Headers
+        0x12, 0x34, // ID
+        0x81, 0x80, // Flags
+        0x00, 0x01, // QD Count = 1
+        0x00, 0x00, // AN Count = 0
+        0x00, 0x01, // NS Count = 1
+        0x00, 0x00, // AR Count = 0
+        // Question
+        0x03, 0x77, 0x77, 0x77, // www
+        0x07, 0x65, 0x78, 0x6d, 0x61, 0x70, 0x6c, 0x65, // exmaple
+        0x03, 0x63, 0x6f, 0x6d, // com
+        0x00, // null
+        0x00, 0x01, // Type = A
+        0x00, 0x01, // Class = IN
+        // Authorative Answer
+        0xc0, 0x10, // Pointer to www.exmaple.com
+        0x00, 0x06, // Type = SOA
+        0x00, 0x01, // Class = IN
+        0x00, 0x00, 0x07, 0x08, // TTL = 1800
+        0x00, 0x2e, // RD Length = 46
+        // RData
+        // MNAME
+        0x03, 0x61, 0x72, 0x61, // ara
+        0x02, 0x6e, 0x73, // ns
+        0x0a, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65, // cloudflare
+        0xc0, 0x18, // com
+        // RNAME
+        0x03, 0x64, 0x6e, 0x73, // dns
+        0xc0, 0x34, // pointer to couldflare.com
+        0x8d, 0x5f, 0xb5, 0x5f, // Serial = 2371859807
+        0x00, 0x00, 0x27, 0x10, // Refresh = 10000
+        0x00, 0x00, 0x09, 0x60, // Retry = 2400
+        0x00, 0x09, 0x3a, 0x80, // Expire = 604800
+        0x00, 0x00, 0x07, 0x08, // Minimum = 1800
+    };
+    var answer = try Packet.deserialize(allocator, &packet);
+    defer answer.deinit();
+
+    // Headers
+    try std.testing.expectEqual(0x12_34, answer.header.id);
+    try std.testing.expectEqual(QueryResponse.response, answer.header.flags.query_response);
+    try std.testing.expectEqual(OperationCode.standard, answer.header.flags.operation_code);
+    try std.testing.expectEqual(AuthoritativeAnswer.no, answer.header.flags.authorative_answer);
+    try std.testing.expectEqual(Truncated.no, answer.header.flags.truncated);
+    try std.testing.expectEqual(RecursionDesired.yes, answer.header.flags.recursion_desired);
+    try std.testing.expectEqual(RecursionAvailable.yes, answer.header.flags.recursion_available);
+    try std.testing.expectEqual(ResponseCode.no_error, answer.header.flags.response_code);
+    try std.testing.expectEqual(0x00_01, answer.header.question_count);
+    try std.testing.expectEqual(0x00_00, answer.header.answer_count);
+    try std.testing.expectEqual(0x00_01, answer.header.authoritive_count);
+    try std.testing.expectEqual(0x00_00, answer.header.additional_count);
+
+    // Question
+    try std.testing.expectEqualSlices(u8, "www.exmaple.com", answer.question.name);
+    try std.testing.expectEqual(QueryType.A, answer.question.type);
+    try std.testing.expectEqual(QueryClass.IN, answer.question.class);
+    try std.testing.expectEqual(null, answer.question.r_data);
+
+    // Answer
+    try std.testing.expectEqual(null, answer.answer);
+
+    // Authorative Answers
+    try std.testing.expectEqualSlices(u8, "exmaple.com", answer.authority.?[0].name);
+    try std.testing.expectEqual(QueryType.SOA, answer.authority.?[0].type);
+    try std.testing.expectEqual(QueryClass.IN, answer.authority.?[0].class);
+    try std.testing.expectEqual(1800, answer.authority.?[0].ttl);
+    try std.testing.expectEqual(46, answer.authority.?[0].rd_length);
+    try std.testing.expectEqual(46, answer.authority.?[0].r_data.?.len);
 
     // Aditional
     try std.testing.expectEqual(null, answer.additional);

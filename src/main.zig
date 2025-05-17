@@ -2,6 +2,7 @@ const std = @import("std");
 const server = @import("./server.zig");
 const packet = @import("./packet.zig");
 const args = @import("./args.zig");
+const config = @import("./config.zig");
 
 pub fn main() !void {
     var buffer: [4096]u8 = undefined;
@@ -17,6 +18,11 @@ pub fn main() !void {
     const domain = args.query_name(argv);
     defer argv.allocator.free(domain);
 
+    var upstream_config = config.JSONConfiguration.init(.{ .allocator = allocator, .path = "./config.json" }) catch |err| {
+        std.debug.panic("Failed to load config file: {}\n", .{err});
+    };
+    defer upstream_config.deinit();
+
     var pkt = packet.Packet.init(.{ .allocator = allocator, .query_name = domain, .id = 0x1234 }) catch |err| {
         std.debug.panic("Failed to initialize Packet: {}\n", .{err});
     };
@@ -28,7 +34,11 @@ pub fn main() !void {
     var len = pkt.serialize(data_pkt) catch |err| {
         std.debug.panic("Failed to serialize Packet: {}\n", .{err});
     };
-    var client = server.UDPClient.init(.{ .address = "1.1.1.1", .port = 53 }) catch |err| {
+
+    const upstream = upstream_config.next_upstream() catch |err| {
+        std.debug.panic("Failed to get next upstream: {}\n", .{err});
+    };
+    var client = server.UDPClient.init(.{ .address = upstream.ip, .port = upstream.port }) catch |err| {
         std.debug.panic("Failed to initialize UDP client: {}\n", .{err});
     };
     defer client.close();

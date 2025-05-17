@@ -28,8 +28,8 @@ const Configuration = struct {
     }
 };
 
-const JSONConfig = struct { allocator: std.mem.Allocator, path: []const u8 };
-const JSONConfiguration = struct {
+pub const JSONConfig = struct { allocator: std.mem.Allocator, path: []const u8 };
+pub const JSONConfiguration = struct {
     json: std.json.Parsed(Configuration),
     configuration: Configuration,
 

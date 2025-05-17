@@ -15,10 +15,10 @@ pub fn main() !void {
         std.debug.panic("Failed to parse args: {}\n", .{err});
     };
     defer argv.deinit();
-    const domain = args.query_name(argv);
-    defer argv.allocator.free(domain);
+    const domain = argv.query_name();
+    const path = argv.config_file();
 
-    var upstream_config = config.JSONConfiguration.init(.{ .allocator = allocator, .path = "./config.json" }) catch |err| {
+    var upstream_config = config.JSONConfiguration.init(.{ .allocator = allocator, .path = path }) catch |err| {
         std.debug.panic("Failed to load config file: {}\n", .{err});
     };
     defer upstream_config.deinit();
